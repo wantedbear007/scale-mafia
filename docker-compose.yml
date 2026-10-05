@@ -11,7 +11,6 @@
 #   api      : 2 CPUs, 4 GB
 #   postgres : 2 CPUs, 4 GB
 #   k6       : 2 CPUs, 2 GB  (profile "load" only)
-#
 # CPU limits are expressed as fractional "nano-CPU" budgets. Note that k6 in
 # this stack still shares the Docker VM with the API and PostgreSQL; for
 # absolute isolation run k6 on the host instead (see README).
