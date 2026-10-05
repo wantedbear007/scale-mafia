@@ -1,0 +1,184 @@
+# Baseline docker compose stack: API + PostgreSQL + k6.
+#
+# Resource limits
+# ---------------
+# Modern Docker Compose (v2 / v5, i.e. `docker compose`, NOT the legacy
+# `docker-compose` v1 python script) implements the `deploy.resources.limits`
+# section for locally created containers. This is a Compose Specification
+# feature and works without Swarm. The limits below are therefore plain
+# `cpus` / `memory` values and are applied to `docker compose up`.
+#
+#   api      : 2 CPUs, 4 GB
+#   postgres : 2 CPUs, 4 GB
+#   k6       : 2 CPUs, 2 GB  (profile "load" only)
+#
+# CPU limits are expressed as fractional "nano-CPU" budgets. Note that k6 in
+# this stack still shares the Docker VM with the API and PostgreSQL; for
+# absolute isolation run k6 on the host instead (see README).
+
+name: scaling-systems
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  postgres:
+    image: postgres:18.6
+    container_name: scaling-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DATABASE_NAME:-scaling}
+      POSTGRES_USER: ${DATABASE_USER:-scaling}
+      POSTGRES_PASSWORD: ${DATABASE_PASSWORD:-scaling}
+      # Deterministic, collation-independent ordering for benchmarks.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    command:
+      # -------------------------------------------------------------------
+      # PostgreSQL tuning policy for the BASELINE:
+      #   * We deliberately pass NO performance tuning flags. shared_buffers
+      #     stays at the 128MB default, work_mem at 4MB, max_parallel_workers
+      #     at 2, etc. The whole point of the first benchmark is to find out
+      #     where the real bottlenecks are with stock settings.
+      #   * The only value changed is max_connections (100 -> 200). That is a
+      #     CAPACITY setting, not a performance knob. The Go pool defaults to
+      #     DATABASE_MAX_OPEN_CONNECTIONS=100; leaving PostgreSQL at 100 would
+      #     make the baseline fail with "too many clients" connection errors
+      #     instead of the latency curve we actually want to measure.
+      #   * fsync, synchronous_commit, full_page_writes all stay ON. Turning
+      #     them off would fake a much higher write throughput.
+      # -------------------------------------------------------------------
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - log_min_duration_statement=2000
+      - -c
+      - log_checkpoints=on
+    ports:
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      # PostgreSQL 18 images moved the data root to /var/lib/postgresql (the
+      # cluster lives in a version-specific subdirectory). Mounting the parent
+      # directory is what the official image expects from 18 onwards and is
+      # also what makes `pg_upgrade --link` possible later.
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      # pg_isready is a true readiness probe: it only succeeds once the
+      # postmaster is accepting connections on the configured database.
+      test: ["CMD-SHELL", "pg_isready -U ${DATABASE_USER:-scaling} -d ${DATABASE_NAME:-scaling}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    networks:
+      - scaling-net
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4g
+        reservations:
+          cpus: "0.5"
+          memory: 512m
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VERSION: ${APP_VERSION:-dev}
+    image: scaling-systems-api:baseline
+    container_name: scaling-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        # depends_on alone only waits for the container to start, so the
+        # compose *healthcheck* is what actually gates startup here. The API
+        # additionally retries the connection for DATABASE_WAIT_TIMEOUT as a
+        # belt-and-braces measure (restarts, transient DNS/network hiccups).
+        condition: service_healthy
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      APP_HOST: 0.0.0.0
+      APP_PORT: "8080"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      APP_READ_TIMEOUT: ${APP_READ_TIMEOUT:-15s}
+      APP_WRITE_TIMEOUT: ${APP_WRITE_TIMEOUT:-30s}
+      APP_IDLE_TIMEOUT: ${APP_IDLE_TIMEOUT:-60s}
+      APP_BODY_LIMIT_BYTES: ${APP_BODY_LIMIT_BYTES:-1048576}
+      DATABASE_HOST: postgres
+      DATABASE_PORT: "5432"
+      DATABASE_NAME: ${DATABASE_NAME:-scaling}
+      DATABASE_USER: ${DATABASE_USER:-scaling}
+      DATABASE_PASSWORD: ${DATABASE_PASSWORD:-scaling}
+      DATABASE_SSLMODE: ${DATABASE_SSLMODE:-disable}
+      DATABASE_MAX_OPEN_CONNECTIONS: ${DATABASE_MAX_OPEN_CONNECTIONS:-100}
+      DATABASE_MAX_IDLE_CONNECTIONS: ${DATABASE_MAX_IDLE_CONNECTIONS:-50}
+      DATABASE_CONN_MAX_LIFETIME: ${DATABASE_CONN_MAX_LIFETIME:-30m}
+      DATABASE_CONN_MAX_IDLE_TIME: ${DATABASE_CONN_MAX_IDLE_TIME:-5m}
+      DATABASE_CONNECT_TIMEOUT: ${DATABASE_CONNECT_TIMEOUT:-10s}
+      DATABASE_WAIT_TIMEOUT: ${DATABASE_WAIT_TIMEOUT:-60s}
+    ports:
+      - "${API_HOST_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "/app/server", "-health-check"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    networks:
+      - scaling-net
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4g
+        reservations:
+          cpus: "0.5"
+          memory: 256m
+
+  # Load generator. Kept out of the default `up` path via the "load" profile so
+  # `docker compose up` never starts it by accident. It has its own CPU/memory
+  # budget so it cannot starve the API, but it does still share the Docker VM -
+  # see the README section "Running k6 outside Docker" for the cleaner option.
+  k6:
+    image: grafana/k6:2.3.0
+    container_name: scaling-k6
+    profiles: ["load"]
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      BASE_URL: http://api:8080
+      # Results land on the host so every run keeps its own summary.json.
+      K6_SUMMARY_EXPORT: /results/summary.json
+    volumes:
+      - ./tests/load:/scripts:ro
+      - ./benchmarks:/results
+    working_dir: /scripts
+    networks:
+      - scaling-net
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2g
+        reservations:
+          cpus: "0.5"
+          memory: 256m
+
+networks:
+  scaling-net:
+    name: scaling-net
+    driver: bridge
+
+volumes:
+  postgres-data:
+    name: scaling-postgres-data

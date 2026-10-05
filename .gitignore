@@ -1,0 +1,20 @@
+# local environment
+.env
+
+# build artefacts
+bin/
+*.test
+coverage.out
+
+# benchmark run artefacts - large and machine specific.
+# benchmarks/baseline/*.md is intentionally NOT ignored: the recorded
+# results are the point of the exercise.
+benchmarks/runs/
+benchmarks/**/*.json
+results/
+*.log
+
+# editors / OS
+.idea/
+.vscode/
+.DS_Store

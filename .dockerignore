@@ -1,0 +1,18 @@
+# Build context exclusions - keeps the Docker build fast and reproducible.
+.git
+.gitignore
+.github
+*.md
+!README.md
+benchmarks/
+results/
+.env
+.env.*
+!.env.example
+Makefile
+docker-compose*.yml
+bin/
+*.log
+.DS_Store
+.idea/
+.vscode/
